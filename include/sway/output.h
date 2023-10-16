@@ -41,6 +41,7 @@ struct sway_output {
 	struct wlr_output *wlr_output;
 	struct wlr_scene_output *scene_output;
 	struct sway_server *server;
+	struct wlr_frame_scheduler *frame_scheduler;
 	struct wl_list link;
 
 	struct wlr_box usable_area;

@@ -8,6 +8,7 @@
 #include <wlr/render/swapchain.h>
 #include <wlr/render/wlr_renderer.h>
 #include <wlr/types/wlr_buffer.h>
+#include <wlr/types/wlr_frame_scheduler.h>
 #include <wlr/types/wlr_gamma_control_v1.h>
 #include <wlr/types/wlr_matrix.h>
 #include <wlr/types/wlr_output_layout.h>
@@ -239,8 +240,6 @@ static int output_repaint_timer_handler(void *data) {
 		return 0;
 	}
 
-	output->wlr_output->frame_pending = false;
-
 	output_configure_scene(output, &root->root_scene->tree.node, 1.0f);
 
 	if (output->gamma_lut_changed) {
@@ -325,7 +324,6 @@ static void handle_frame(struct wl_listener *listener, void *user_data) {
 	if (delay < 1) {
 		output_repaint_timer_handler(output);
 	} else {
-		output->wlr_output->frame_pending = true;
 		wl_event_source_timer_update(output->repaint_timer, delay);
 	}
 
@@ -509,7 +507,7 @@ void handle_new_output(struct wl_listener *listener, void *data) {
 	output->commit.notify = handle_commit;
 	wl_signal_add(&wlr_output->events.present, &output->present);
 	output->present.notify = handle_present;
-	wl_signal_add(&wlr_output->events.frame, &output->frame);
+	wl_signal_add(&output->frame_scheduler->events.frame, &output->frame);
 	output->frame.notify = handle_frame;
 	wl_signal_add(&wlr_output->events.request_state, &output->request_state);
 	output->request_state.notify = handle_request_state;
@@ -547,7 +545,7 @@ void handle_gamma_control_set_gamma(struct wl_listener *listener, void *data) {
 	}
 
 	output->gamma_lut_changed = true;
-	wlr_output_schedule_frame(output->wlr_output);
+	wlr_frame_scheduler_schedule_frame(output->frame_scheduler);
 }
 
 static struct output_config *output_config_for_config_head(
