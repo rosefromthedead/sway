@@ -1,14 +1,13 @@
-#include <assert.h>
 #include <stdlib.h>
 #include <strings.h>
 #include <time.h>
 #include <wayland-server-core.h>
 #include <wlr/config.h>
 #include <wlr/backend/headless.h>
+#include <wlr/interfaces/wlr_frame_scheduler.h>
 #include <wlr/render/swapchain.h>
 #include <wlr/render/wlr_renderer.h>
 #include <wlr/types/wlr_buffer.h>
-#include <wlr/types/wlr_frame_scheduler.h>
 #include <wlr/types/wlr_gamma_control_v1.h>
 #include <wlr/types/wlr_matrix.h>
 #include <wlr/types/wlr_output_layout.h>
@@ -19,7 +18,6 @@
 #include <wlr/types/wlr_compositor.h>
 #include <wlr/util/region.h>
 #include <wlr/util/transform.h>
-#include "config.h"
 #include "log.h"
 #include "sway/config.h"
 #include "sway/desktop/transaction.h"
@@ -30,6 +28,7 @@
 #include "sway/output.h"
 #include "sway/scene_descriptor.h"
 #include "sway/server.h"
+#include "sway/timer_frame_scheduler.h"
 #include "sway/tree/arrange.h"
 #include "sway/tree/container.h"
 #include "sway/tree/root.h"
@@ -233,11 +232,50 @@ static void output_configure_scene(struct sway_output *output,
 	}
 }
 
-static int output_repaint_timer_handler(void *data) {
-	struct sway_output *output = data;
+int get_msec_until_refresh(const struct wlr_output_event_present *event) {
+	// Compute predicted milliseconds until the next refresh. It's used for
+	// delaying both output rendering and surface frame callbacks.
+	int msec_until_refresh = 0;
 
-	if (!output->enabled) {
-		return 0;
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+
+	const long NSEC_IN_SECONDS = 1000000000;
+	struct timespec predicted_refresh = *event->when;
+	predicted_refresh.tv_nsec += event->refresh % NSEC_IN_SECONDS;
+	predicted_refresh.tv_sec += event->refresh / NSEC_IN_SECONDS;
+	if (predicted_refresh.tv_nsec >= NSEC_IN_SECONDS) {
+		predicted_refresh.tv_sec += 1;
+		predicted_refresh.tv_nsec -= NSEC_IN_SECONDS;
+	}
+
+	// If the predicted refresh time is before the current time then
+	// there's no point in delaying.
+	//
+	// We only check tv_sec because if the predicted refresh time is less
+	// than a second before the current time, then msec_until_refresh will
+	// end up slightly below zero, which will effectively disable the delay
+	// without potential disastrous negative overflows that could occur if
+	// tv_sec was not checked.
+	if (predicted_refresh.tv_sec >= now.tv_sec) {
+		long nsec_until_refresh
+			= (predicted_refresh.tv_sec - now.tv_sec) * NSEC_IN_SECONDS
+				+ (predicted_refresh.tv_nsec - now.tv_nsec);
+
+		// We want msec_until_refresh to be conservative, that is, floored.
+		// If we have 7.9 msec until refresh, we better compute the delay
+		// as if we had only 7 msec, so that we don't accidentally delay
+		// more than necessary and miss a frame.
+		msec_until_refresh = nsec_until_refresh / 1000000;
+	}
+
+	return msec_until_refresh;
+}
+
+static void output_redraw(struct sway_output *output) {
+	struct wlr_output *wlr_output = output->wlr_output;
+	if (wlr_output == NULL) {
+		return;
 	}
 
 	output_configure_scene(output, &root->root_scene->tree.node, 1.0f);
@@ -246,7 +284,7 @@ static int output_repaint_timer_handler(void *data) {
 		struct wlr_output_state pending;
 		wlr_output_state_init(&pending);
 		if (!wlr_scene_output_build_state(output->scene_output, &pending, NULL)) {
-			return 0;
+			return;
 		}
 
 		output->gamma_lut_changed = false;
@@ -255,21 +293,21 @@ static int output_repaint_timer_handler(void *data) {
 			server.gamma_control_manager_v1, output->wlr_output);
 		if (!wlr_gamma_control_v1_apply(gamma_control, &pending)) {
 			wlr_output_state_finish(&pending);
-			return 0;
+			return;
 		}
 
 		if (!wlr_output_commit_state(output->wlr_output, &pending)) {
 			wlr_gamma_control_v1_send_failed_and_destroy(gamma_control);
 			wlr_output_state_finish(&pending);
-			return 0;
+			return;
 		}
 
 		wlr_output_state_finish(&pending);
-		return 0;
+		return;
 	}
 
 	wlr_scene_output_commit(output->scene_output, NULL);
-	return 0;
+	return;
 }
 
 static void handle_frame(struct wl_listener *listener, void *user_data) {
@@ -279,60 +317,34 @@ static void handle_frame(struct wl_listener *listener, void *user_data) {
 		return;
 	}
 
-	// Compute predicted milliseconds until the next refresh. It's used for
-	// delaying both output rendering and surface frame callbacks.
-	int msec_until_refresh = 0;
+	output_redraw(output);
+}
 
-	if (output->max_render_time != 0) {
-		struct timespec now;
-		clock_gettime(CLOCK_MONOTONIC, &now);
+static void output_set_frame_scheduler(struct sway_output *output,
+		struct wlr_frame_scheduler *scheduler) {
+	wl_list_remove(&output->frame.link);
 
-		const long NSEC_IN_SECONDS = 1000000000;
-		struct timespec predicted_refresh = output->last_presentation;
-		predicted_refresh.tv_nsec += output->refresh_nsec % NSEC_IN_SECONDS;
-		predicted_refresh.tv_sec += output->refresh_nsec / NSEC_IN_SECONDS;
-		if (predicted_refresh.tv_nsec >= NSEC_IN_SECONDS) {
-			predicted_refresh.tv_sec += 1;
-			predicted_refresh.tv_nsec -= NSEC_IN_SECONDS;
-		}
+	wlr_frame_scheduler_destroy(output->frame_scheduler);
+	output->frame_scheduler = scheduler;
+	output->scene_output->frame_scheduler = scheduler;
 
-		// If the predicted refresh time is before the current time then
-		// there's no point in delaying.
-		//
-		// We only check tv_sec because if the predicted refresh time is less
-		// than a second before the current time, then msec_until_refresh will
-		// end up slightly below zero, which will effectively disable the delay
-		// without potential disastrous negative overflows that could occur if
-		// tv_sec was not checked.
-		if (predicted_refresh.tv_sec >= now.tv_sec) {
-			long nsec_until_refresh
-				= (predicted_refresh.tv_sec - now.tv_sec) * NSEC_IN_SECONDS
-					+ (predicted_refresh.tv_nsec - now.tv_nsec);
+	output->frame.notify = handle_frame;
+	wl_signal_add(&output->frame_scheduler->events.frame, &output->frame);
+}
 
-			// We want msec_until_refresh to be conservative, that is, floored.
-			// If we have 7.9 msec until refresh, we better compute the delay
-			// as if we had only 7 msec, so that we don't accidentally delay
-			// more than necessary and miss a frame.
-			msec_until_refresh = nsec_until_refresh / 1000000;
-		}
-	}
-
-	int delay = msec_until_refresh - output->max_render_time;
-
-	// If the delay is less than 1 millisecond (which is the least we can wait)
-	// then just render right away.
-	if (delay < 1) {
-		output_repaint_timer_handler(output);
+void output_set_max_render_time(struct sway_output *output, int max_render_time) {
+	struct wlr_frame_scheduler *scheduler;
+	if (max_render_time != 0) {
+		scheduler = timed_frame_scheduler_create(output->wlr_output, max_render_time);
 	} else {
-		wl_event_source_timer_update(output->repaint_timer, delay);
+		scheduler = wlr_frame_scheduler_autocreate(output->wlr_output);
+	}
+	if (scheduler == NULL) {
+		sway_log(SWAY_ERROR, "Failed to create output frame scheduler");
+		return;
 	}
 
-	// Send frame done to all visible surfaces
-	struct send_frame_done_data data = {0};
-	clock_gettime(CLOCK_MONOTONIC, &data.when);
-	data.msec_until_refresh = msec_until_refresh;
-	data.output = output;
-	wlr_scene_output_for_each_buffer(output->scene_output, send_frame_done_iterator, &data);
+	output_set_frame_scheduler(output, scheduler);
 }
 
 static void update_output_manager_config(struct sway_server *server) {
@@ -425,14 +437,18 @@ static void handle_commit(struct wl_listener *listener, void *data) {
 
 static void handle_present(struct wl_listener *listener, void *data) {
 	struct sway_output *output = wl_container_of(listener, output, present);
-	struct wlr_output_event_present *output_event = data;
+	struct wlr_output_event_present *event = data;
 
-	if (!output->enabled || !output_event->presented) {
+	if (!output->enabled || !event->presented) {
 		return;
 	}
 
-	output->last_presentation = *output_event->when;
-	output->refresh_nsec = output_event->refresh;
+	// Send frame done to all visible surfaces
+	struct send_frame_done_data frame_done_data = {0};
+	clock_gettime(CLOCK_MONOTONIC, &frame_done_data.when);
+	frame_done_data.msec_until_refresh = get_msec_until_refresh(event);
+	frame_done_data.output = output;
+	wlr_scene_output_for_each_buffer(output->scene_output, send_frame_done_iterator, &frame_done_data);
 }
 
 static void handle_request_state(struct wl_listener *listener, void *data) {
@@ -507,13 +523,11 @@ void handle_new_output(struct wl_listener *listener, void *data) {
 	output->commit.notify = handle_commit;
 	wl_signal_add(&wlr_output->events.present, &output->present);
 	output->present.notify = handle_present;
-	wl_signal_add(&output->frame_scheduler->events.frame, &output->frame);
-	output->frame.notify = handle_frame;
 	wl_signal_add(&wlr_output->events.request_state, &output->request_state);
 	output->request_state.notify = handle_request_state;
 
-	output->repaint_timer = wl_event_loop_add_timer(server->wl_event_loop,
-		output_repaint_timer_handler, output);
+	wl_list_init(&output->frame.link);
+	output_set_max_render_time(output, 0);
 
 	if (server->session_lock.lock) {
 		sway_session_lock_add_output(server->session_lock.lock, output);

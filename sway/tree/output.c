@@ -136,7 +136,6 @@ struct sway_output *output_create(struct wlr_output *wlr_output) {
 	wlr_output->data = output;
 	output->detected_subpixel = wlr_output->subpixel;
 	output->scale_filter = SCALE_FILTER_NEAREST;
-	output->frame_scheduler = wlr_frame_scheduler_autocreate(wlr_output);
 
 	wl_signal_init(&output->events.disable);
 
@@ -280,7 +279,6 @@ void output_destroy(struct sway_output *output) {
 	destroy_scene_layers(output);
 	list_free(output->workspaces);
 	list_free(output->current.workspaces);
-	wl_event_source_remove(output->repaint_timer);
 	free(output);
 }
 
